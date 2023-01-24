@@ -66,7 +66,7 @@ class Conv1D(nn.Module):
         return x
 
 class GPT2MLP(nn.Module):
-    def __init__(self, intermediate_size, config):
+    def __init__(self, config):
         super().__init__()
         embed_dim = config.hidden_size
         self.c_fc = Conv1D(intermediate_size, embed_dim)
@@ -74,12 +74,12 @@ class GPT2MLP(nn.Module):
         self.act = NewGELUActivation()
         self.dropout = nn.Dropout(config.resid_pdrop)
 
-    def forward(self, hidden_states):
-        hidden_states = self.c_fc(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.c_proj(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        return hidden_states
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.act(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
 
 class GPT2Attention(nn.Module):
     def __init__(self, config):
@@ -92,18 +92,53 @@ class GPT2Attention(nn.Module):
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
-    def forward(self,)
-        query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+    def forward(self, x):
+        batch_size, seq_len, hidden_dim = x.shape
+        num_heads, head_dim = self.config.num_heads, self.config.head_dim
 
-def compute_flash_attention(query_states, key_states, value_states):
+        q, k, v = self.c_attn(x).split(self.split_size, dim=2)
+
+        q = q.view(batch_size, seq_len, num_heads, head_dim)
+        k = k.view(batch_size, seq_len, num_heads, head_dim)
+        v = v.view(batch_size, seq_len, num_heads, head_dim)
+
+        flash_attn_out = compute_flash_attention(
+            query_states = q, 
+            key_states = k, 
+            value_states = v
+            )
+
+        flash_attn_out = flash_attn_out.contiguous().view(
+            batch_size, seq_len, hidden_dim
+            )
+
+        attn_out = self.c_proj(flash_attn_out)
+
+        attn_out = self.resid_dropout(attn_out)
+
+        return attn_out
+
+
+
+def stabilize_hidden_states(hidden_states):
+    if hidden_states.dtype == torch.float16 and torch.isinf(hidden_states).any():
+        clamp_value = torch.finfo(hidden_states.dtype).max - 1000
+        hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+    return hidden_states
+
+
+def compute_flash_attention(query_states, key_states, value_states, bias, causal, softmax_scale):
     """Flash Attention (Triton version)
     :param query_states: [batch_size, q_seq_len, num_heads, head_size]
     :param key_states: [batch_size, kv_seq_len, num_heads, head_size]
     :param value_states: [batch_size, kv_seq_len, num_heads, head_size]
     :return: attn_out: [batch_size, q_seq_len, num_heads, head_size]
     """
-    return flash_attn_triton.flash_attention(
+    return flash_attn_triton.flash_attn_func(
         query_states, 
         key_states, 
-        value_states
+        value_states,
+        bias=None,
+        causal=True,
+        softmax_scale=1.0
     )
