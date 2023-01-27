@@ -3,10 +3,19 @@ from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn as nn
-import flash_attn.flash_attn_triton as flash_attn_triton
+#import flash_attn.flash_attn_triton as flash_attn_triton
 
-# @dataclass
-# class GPT2Config:
+from triton_flash import flash_attn_func
+
+from einops import rearrange, repeat
+
+@dataclass
+class GPT2Config:
+    num_heads = 8
+    head_dim = 64
+    hidden_dim = 512
+    attn_pdrop = 0.1
+    resid_pdrop = 0.1
 
 
 # GPT2BaseConfig = GPT2Config(
@@ -60,9 +69,14 @@ class Conv1D(nn.Module):
         self.bias = nn.Parameter(torch.zeros(nf))
 
     def forward(self, x):
+
+        print(self.weight, self.bias)
+
         size_out = x.size()[:-1] + (self.nf,)
         x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
+
         x = x.view(size_out)
+
         return x
 
 class GPT2MLP(nn.Module):
@@ -96,29 +110,40 @@ class GPT2Attention(nn.Module):
         batch_size, seq_len, hidden_dim = x.shape
         num_heads, head_dim = self.config.num_heads, self.config.head_dim
 
-        q, k, v = self.c_attn(x).split(self.split_size, dim=2)
+        print(x.shape)
 
-        q = q.view(batch_size, seq_len, num_heads, head_dim)
-        k = k.view(batch_size, seq_len, num_heads, head_dim)
-        v = v.view(batch_size, seq_len, num_heads, head_dim)
 
-        flash_attn_out = compute_flash_attention(
-            query_states = q, 
-            key_states = k, 
-            value_states = v
-            )
+        qkv = self.c_attn(x).chunk(3, dim=-1)
 
-        flash_attn_out = flash_attn_out.contiguous().view(
-            batch_size, seq_len, hidden_dim
-            )
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b n h d', h = num_heads), qkv)
 
-        attn_out = self.c_proj(flash_attn_out)
+        # batch_size, seq_len, num_heads, head_dim
+
+        print(q.shape, k.shape, v.shape)
+
+        flash_attn_out = flash_attn_func(
+            q, 
+            k, 
+            v,
+            None,
+            True,
+            None
+        )
+
+        out = rearrange(flash_attn_out, 'b n h d -> b n (h d)')
+
+        attn_out = self.c_proj(out)
 
         attn_out = self.resid_dropout(attn_out)
 
         return attn_out
 
+# Test GPT2Attention
+config = GPT2Config()
 
+attention = GPT2Attention(config).to(torch.float16).cuda()
+
+print(attention(torch.randn(1, 512, 512).to(torch.float16).cuda()))
 
 def stabilize_hidden_states(hidden_states):
     if hidden_states.dtype == torch.float16 and torch.isinf(hidden_states).any():
@@ -127,18 +152,3 @@ def stabilize_hidden_states(hidden_states):
     return hidden_states
 
 
-def compute_flash_attention(query_states, key_states, value_states, bias, causal, softmax_scale):
-    """Flash Attention (Triton version)
-    :param query_states: [batch_size, q_seq_len, num_heads, head_size]
-    :param key_states: [batch_size, kv_seq_len, num_heads, head_size]
-    :param value_states: [batch_size, kv_seq_len, num_heads, head_size]
-    :return: attn_out: [batch_size, q_seq_len, num_heads, head_size]
-    """
-    return flash_attn_triton.flash_attn_func(
-        query_states, 
-        key_states, 
-        value_states,
-        bias=None,
-        causal=True,
-        softmax_scale=1.0
-    )
