@@ -11,15 +11,56 @@ from einops import rearrange, repeat
 
 @dataclass
 class GPT2Config:
-    num_heads = 8
-    head_dim = 64
-    hidden_dim = 512
-    attn_pdrop = 0.1
-    resid_pdrop = 0.1
+    dim: int = 512
+    hidden_dim: int = 512
+    num_heads: int = 8
+    num_layers: int = 12
+    dim_head: int = 64
+    attn_pdrop: float = 0.1
+    dropout: float = 0.1
+    vocab_size: int = 50257
+    layer_norm_epsilon: float = 1e-5
+
+"""
+{
+  "activation_function": "gelu_new",
+  "architectures": [
+    "GPT2LMHeadModel"
+  ],
+  "attn_pdrop": 0.1,
+  "bos_token_id": 50256,
+  "embd_pdrop": 0.1,
+  "eos_token_id": 50256,
+  "initializer_range": 0.02,
+  "layer_norm_epsilon": 1e-05,
+  "model_type": "gpt2",
+  "n_ctx": 1024,
+  "n_embd": 768,
+  "n_head": 12,
+  "n_layer": 12,
+  "n_positions": 1024,
+  "resid_pdrop": 0.1,
+  "summary_activation": null,
+  "summary_first_dropout": 0.1,
+  "summary_proj_to_labels": true,
+  "summary_type": "cls_index",
+  "summary_use_proj": true,
+  "task_specific_params": {
+    "text-generation": {
+      "do_sample": true,
+      "max_length": 50
+    }
+  },
+  "vocab_size": 50257
+}
+"""
+
 
 
 # GPT2BaseConfig = GPT2Config(
-
+#     hidden_dim = 512,
+#     num_heads = 8,
+#     num_layers = 12,
 # )
 
 # GPT2MediumConfig = GPT2Config(
@@ -82,11 +123,10 @@ class Conv1D(nn.Module):
 class GPT2MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        embed_dim = config.hidden_size
-        self.c_fc = Conv1D(intermediate_size, embed_dim)
-        self.c_proj = Conv1D(embed_dim, intermediate_size)
+        self.c_fc = Conv1D(config.dim, config.hidden_dim)
+        self.c_proj = Conv1D(config.hidden_dim, config.dim)
         self.act = NewGELUActivation()
-        self.dropout = nn.Dropout(config.resid_pdrop)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -99,16 +139,15 @@ class GPT2Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        inner_dim = config.num_heads * config.head_dim
+        inner_dim = config.num_heads * config.dim_head
         self.c_attn = Conv1D(3 * inner_dim, config.hidden_dim)
         self.c_proj = Conv1D(config.hidden_dim, inner_dim)
 
-        self.attn_dropout = nn.Dropout(config.attn_pdrop)
-        self.resid_dropout = nn.Dropout(config.resid_pdrop)
+        self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         batch_size, seq_len, hidden_dim = x.shape
-        num_heads, head_dim = self.config.num_heads, self.config.head_dim
+        num_heads = self.config.num_heads
 
         print(x.shape)
 
@@ -121,14 +160,7 @@ class GPT2Attention(nn.Module):
 
         print(q.shape, k.shape, v.shape)
 
-        flash_attn_out = flash_attn_func(
-            q, 
-            k, 
-            v,
-            None,
-            True,
-            None
-        )
+        flash_attn_out = flash_attn_func(q, k, v, None, True, None)
 
         out = rearrange(flash_attn_out, 'b n h d -> b n (h d)')
 
@@ -138,12 +170,38 @@ class GPT2Attention(nn.Module):
 
         return attn_out
 
+class GPT2Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.hidden_dim, eps=config.layer_norm_epsilon)
+        self.attn = GPT2Attention(config)
+        self.ln_2 = nn.LayerNorm(config.hidden_dim, eps=config.layer_norm_epsilon)
+        self.mlp = GPT2MLP(config)
+
+    def forward(self, x):
+        a = self.attn(self.ln_1(x))
+        x = x + a
+        m = self.mlp(self.ln_2(x))
+        x = x + m
+        return x
+
+
+
+
 # Test GPT2Attention
-config = GPT2Config()
+config = GPT2Config
 
 attention = GPT2Attention(config).to(torch.float16).cuda()
 
 print(attention(torch.randn(1, 512, 512).to(torch.float16).cuda()))
+
+# Test GPT2Block
+
+block = GPT2Block(config).to(torch.float16).cuda()
+
+print(block(torch.randn(1, 512, 512).to(torch.float16).cuda()))
+
+
 
 def stabilize_hidden_states(hidden_states):
     if hidden_states.dtype == torch.float16 and torch.isinf(hidden_states).any():
