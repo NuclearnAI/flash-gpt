@@ -147,16 +147,15 @@ class GPT2Attention(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len, hidden_dim = x.shape
-        num_heads = self.config.num_heads
+        h = self.config.num_heads
 
         print(x.shape)
 
-
         qkv = self.c_attn(x).chunk(3, dim=-1)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b n h d', h = num_heads), qkv)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b n h d', h = h), qkv)
 
-        # batch_size, seq_len, num_heads, head_dim
+        # batch_size, seq_len, num_heads, head_dim for flash attention
 
         print(q.shape, k.shape, v.shape)
 
@@ -179,13 +178,43 @@ class GPT2Block(nn.Module):
         self.mlp = GPT2MLP(config)
 
     def forward(self, x):
-        a = self.attn(self.ln_1(x))
-        x = x + a
-        m = self.mlp(self.ln_2(x))
-        x = x + m
+        residual = x
+        x = self.ln_1(x)
+        x = self.attn(x) + residual
+        residual = x
+        x = self.ln_2(x)
+        x = self.mlp(x) + residual
         return x
 
+class GPT2Model(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
 
+        self.token_emb = nn.Embedding(config.vocab_size, config.hidden_dim)
+        self.pos_emb = nn.Embedding(config.max_position_embeddings, config.hidden_dim)
+
+        self.drop = nn.Dropout(config.dropout)
+
+        self.h = nn.ModuleList([GPT2Block(config) for _ in range(config.num_layers)])
+        
+        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+
+    def forward(self, input_ids):
+        batch_size, seq_len = input_ids.shape
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+
+        inputs_embeds = self.wte(input_ids)
+        position_embeds = self.wpe(position_ids)
+
+        hidden_states = inputs_embeds + position_embeds
+        hidden_states = self.drop(hidden_states)
+
+        for block in self.h:
+            hidden_states = block(hidden_states)
+
+        return hidden_states
 
 
 # Test GPT2Attention
@@ -208,5 +237,4 @@ def stabilize_hidden_states(hidden_states):
         clamp_value = torch.finfo(hidden_states.dtype).max - 1000
         hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
     return hidden_states
-
 
