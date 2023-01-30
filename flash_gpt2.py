@@ -16,6 +16,7 @@ class GPT2Config:
     num_heads: int = 8
     num_layers: int = 12
     dim_head: int = 64
+    max_seq_len: int = 1024
     attn_pdrop: float = 0.1
     dropout: float = 0.1
     vocab_size: int = 50257
@@ -192,29 +193,28 @@ class GPT2Model(nn.Module):
         self.config = config
 
         self.token_emb = nn.Embedding(config.vocab_size, config.hidden_dim)
-        self.pos_emb = nn.Embedding(config.max_position_embeddings, config.hidden_dim)
+        self.pos_emb = nn.Embedding(config.max_seq_len, config.hidden_dim)
 
         self.drop = nn.Dropout(config.dropout)
 
-        self.h = nn.ModuleList([GPT2Block(config) for _ in range(config.num_layers)])
+        self.layers = nn.ModuleList([])
+        for _ in range(config.num_layers):
+            self.layers.append(GPT2Block(config))
         
-        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        self.ln_f = nn.LayerNorm(config.hidden_dim, eps=config.layer_norm_epsilon)
 
-    def forward(self, input_ids):
-        batch_size, seq_len = input_ids.shape
-        position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+    def forward(self, x):
 
-        inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
+        x = self.token_emb(x)
+        x = x + self.pos_emb(torch.arange(x.shape[1], device=x.device))
+        x = self.drop(x)
 
-        hidden_states = inputs_embeds + position_embeds
-        hidden_states = self.drop(hidden_states)
+        for block in self.layers:
+            x = block(x)
 
-        for block in self.h:
-            hidden_states = block(hidden_states)
+        x = self.ln_f(x)
 
-        return hidden_states
+        return x
 
 
 # Test GPT2Attention
@@ -230,6 +230,13 @@ block = GPT2Block(config).to(torch.float16).cuda()
 
 print(block(torch.randn(1, 512, 512).to(torch.float16).cuda()))
 
+# Test GPT2Model
+
+model = GPT2Model(config).to(torch.float16).cuda()
+
+print(model(
+    torch.randint(0, 50257, (1, 512)).to(torch.float16).cuda()
+))
 
 
 def stabilize_hidden_states(hidden_states):
